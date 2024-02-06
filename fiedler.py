@@ -3,6 +3,28 @@ import scipy.linalg as la
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
+def symmetric_permutation(A,p):
+    A = A.tocsc()
+    invp=[0 for _ in p]
+    for i,pi in enumerate(p):
+        invp[pi]=i
+    rids=[]
+    cids=[]
+    vals=[]
+    for c in p:
+        beg=A.indptr[c]
+        end=A.indptr[c+1]
+        for i in range(beg,end):
+            r=A.indices[i]
+            v=A.data[i]
+            rids.append(invp[r])
+            cids.append(invp[c])
+            vals.append(v)
+    return sp.coo_array((vals,(rids,cids)),A.shape)
+
+
+
+
 #Random sparse matrix with nonzero pattern pulled from a normal distribution centered at each row
 #Just some reused code to generate sparse matrix. the nonzeros later get discarded because
 #we're only interested in graph laplacians here.
@@ -49,6 +71,52 @@ def banded_preconditioner(A,band=5):
         cids.append(c)
         vals.append(v)
     return sp.coo_matrix((vals,(rids,cids))).tocsc()
+
+class RCMBandPrecon:
+    def __init__(self, A, band):
+        self.A = A.tocsc()
+        p = sp.csgraph.reverse_cuthill_mckee(self.A, symmetric_mode=True)
+        self.p = p
+        ip = [0 for _ in p]
+        for i,pi in enumerate(p):
+            ip[pi]=i
+        self.ip = ip
+        self.A = symmetric_permutation(self.A,self.p)
+        self.Ah = banded_preconditioner(self.A,band=band)
+        self.luAh = spla.splu(self.Ah)
+    def solve(self,x):
+        if len(x.shape)==1:
+            xp = x[self.p]
+        if len(x.shape)==2:
+            xp = x[self.p,:]
+
+        y = self.luAh.solve(xp)
+
+        if len(x.shape)==1:
+            return y[self.ip]
+        if len(x.shape)==2:
+            return y[self.ip,:]
+
+
+
+
+#Simple prolongation operator usable to define 
+#coarse grids
+def prolongation(m,k):
+    rids=[]
+    cids=[]
+    vals=[]
+    for p,i in enumerate(range(0,m,m//k)):
+        ibeg=i
+        iend=min(m,ibeg+m//k)
+        v = iend-ibeg
+        for j in range(ibeg,iend):
+            cids.append(p)
+            rids.append(j)
+            vals.append(1.0/np.sqrt(v))
+    P = sp.coo_matrix((vals,(rids,cids)))
+    return P
+
 
 
 
@@ -127,18 +195,20 @@ def lobpcg_noprecon(A,k=6,rng=None,tol=1e-2):
 
 
 
-#Unpreconditioned LOBPCG
+#lobpcg with banded preconditioner
 #
 def lobpcg_banded_precon(A,k=6,tol=1e-2,rng=None):
     if rng is None:
         rng = np.random.default_rng(0)
     G = graph_laplacian(A)
     processed_nonzeros=0
-    band=5
-    Gh = banded_preconditioner(G,band=band)
+
     #Note: since we have excluded some off-diagonal entries the 
     #resulting matrix is usually invertible.
+    band=5
+    Gh = banded_preconditioner(G,band=band)
     luGh = spla.splu(Gh)
+    #luGh = RCMBandPrecon(G, band)
     def evalGh(x):
         nonlocal processed_nonzeros
         #This is an approximate number of nonzeros 
@@ -148,6 +218,7 @@ def lobpcg_banded_precon(A,k=6,tol=1e-2,rng=None):
         #here because G is semidefinite (and Gh should become _definite_ after
         #discarding some off-diagonal entries)
         processed_nonzeros += 2*band*G.shape[0]
+        #processed_nonzeros += nnz
         return luGh.solve(x)
     def evalG(x):
         nonlocal processed_nonzeros
@@ -168,29 +239,117 @@ def lobpcg_banded_precon(A,k=6,tol=1e-2,rng=None):
 
 
 
+#lobpcg with ilu preconditioner
+#
+def lobpcg_ilu_precon(A,k=6,tol=1e-3,rng=None):
+    if rng is None:
+        rng = np.random.default_rng(0)
+    G = graph_laplacian(A)
+    processed_nonzeros=0
+    band=5
+    #Note: since we have excluded some off-diagonal entries the 
+    #resulting matrix is usually invertible.
+    luGh = spla.spilu(G)
+    nnz = luGh.L.nnz + luGh.U.nnz
+    def evalGh(x):
+        nonlocal processed_nonzeros
+        processed_nonzeros += nnz
+        return luGh.solve(x)
+    def evalG(x):
+        nonlocal processed_nonzeros
+        processed_nonzeros += G.nnz
+        return G@x
+
+    X = rng.uniform(-1,1,size=(G.shape[0],k))
+    #Go ahead and put the nullspace in `X` the algorithm
+    #should register it as converged immediately and project it
+    #out of the remaining eigenvectors
+    X[:,0] = np.ones(G.shape[0])
+    eigG,V = spla.lobpcg(spla.LinearOperator(G.shape,matvec=evalG),X,M = spla.LinearOperator(G.shape,matvec=evalGh),largest=False,maxiter=200,tol=tol)
+    ids=np.argsort(eigG)
+    eigG=eigG[ids]
+    V = V[:,ids]
+    return eigG[1],V[:,1],processed_nonzeros
 
 
 
 
+#lobpcg with two-grid preconditioner
+def lobpcg_twogrid_precon(A,k=6,tol=1e-3,rng=None):
+    if rng is None:
+        rng = np.random.default_rng(0)
+    G = graph_laplacian(A)
+    P = prolongation(G.shape[0],G.shape[0]//2)
+    Gh = P.T @ G @ P
+    processed_nonzeros=0
+    luGh = spla.splu(Gh)
+    nnz = luGh.L.nnz + luGh.U.nnz
+    alpha = 1e-3
+    def evalGh(x):
+        nonlocal processed_nonzeros
+        r = x - G @ (P @ luGh.solve(P.T @ x))
+        #processed_nonzeros += nnz + G.nnz
+        processed_nonzeros += G.nnz
+        return x + alpha*r
+    def evalG(x):
+        nonlocal processed_nonzeros
+        processed_nonzeros += G.nnz
+        return G@x
+
+    X = rng.uniform(-1,1,size=(G.shape[0],k))
+    #Go ahead and put the nullspace in `X` the algorithm
+    #should register it as converged immediately and project it
+    #out of the remaining eigenvectors
+    X[:,0] = np.ones(G.shape[0])
+    eigG,V = spla.lobpcg(spla.LinearOperator(G.shape,matvec=evalG),X,M = spla.LinearOperator(G.shape,matvec=evalGh),largest=False,maxiter=200,tol=tol)
+    ids=np.argsort(eigG)
+    eigG=eigG[ids]
+    V = V[:,ids]
+    return eigG[1],V[:,1],processed_nonzeros
 
 
+def inverse_lanczos(A):
+    G = graph_laplacian(A)
+    m,_ = G.shape
+    processed_nonzeros=0
+    def evalG(x):
+        nonlocal processed_nonzeros
+        processed_nonzeros+=G.nnz
+        return G@x
 
+    def solveG(x):
+        #Project out the nullspace of G
+        x = x - np.mean(x)
+        if np.linalg.norm(x)<1e-10:
+            return np.zeros_like(x)
+        y,info = spla.cg(spla.LinearOperator((m,m),matvec=evalG),x,tol=1e-10)
+        return y
 
+    eigG,V = spla.eigsh(spla.LinearOperator((m,m),matvec=evalG),k=10,sigma=0.0,OPinv=spla.LinearOperator((m,m),matvec=solveG))
+    return eigG[0],V[:,0],processed_nonzeros
 
+def inverse_lanczos_ilu(A):
+    G = graph_laplacian(A)
+    m,_ = G.shape
+    processed_nonzeros=0
+    iluG = spla.spilu(G)
+    nnz = iluG.L.nnz + iluG.U.nnz
+    def evalG(x):
+        nonlocal processed_nonzeros
+        processed_nonzeros+=G.nnz
+        return G@x
+    def solveGh(x):
+        nonlocal processed_nonzeros
+        processed_nonzeros+=nnz
+        return iluG.solve(x)
+    def solveG(x):
+        #Project out the nullspace of G
+        x = x - np.mean(x)
+        if np.linalg.norm(x)<1e-10:
+            return np.zeros_like(x)
+        y,info = spla.cg(spla.LinearOperator((m,m),matvec=evalG),x,M = spla.LinearOperator((m,m),matvec=solveGh),tol=1e-4)
+        return y
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    eigG,V = spla.eigsh(spla.LinearOperator((m,m),matvec=evalG),k=10,sigma=0.0,OPinv=spla.LinearOperator((m,m),matvec=solveG),tol=1e-8)
+    return eigG[0],V[:,0],processed_nonzeros
 
